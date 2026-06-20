@@ -147,9 +147,12 @@ archon workflow run archon-bmad-story-automator "epic 2"
 
 Edit `workflows/archon-bmad-story-automator.yaml` to taste:
 
-- `model:` — workflow default is `medium`; the heavy `build-loop` node is pinned to `large` because
-  under-powering the dev/review work is the main reason naive automation produces slop. Lower it (or
-  point it at a [tier/alias](https://archon.diy)) if you want to trade quality for cost.
+- `model:` — uses real Claude aliases so it works without extra setup: default `sonnet`, the heavy
+  `build-loop` node `opus` (dev + adversarial review — under-powering this is the main reason naive
+  automation produces slop), and the `report` node `haiku`. `opus` over a long multi-story run is the
+  expensive part; drop `build-loop` to `sonnet` to trade quality for cost. If you'd rather use Archon
+  tier presets (`small`/`medium`/`large`), configure them first with `archon ai tier set <tier>
+  claude <model>` — unconfigured tier names fail to resolve.
 - `build-loop.loop.max_iterations` (default `150`) — raise for very large multi-epic runs.
 - `build-loop.idle_timeout` (default `1800000` ms = 30 min) — raise if `dev-story` sessions run long.
 - `build-loop.loop.until` / retry counts (`maxReviewRetries`, `maxCreateRetries`) — tune the gates.

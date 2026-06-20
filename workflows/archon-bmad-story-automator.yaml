@@ -17,7 +17,7 @@ description: |
   bmad-retrospective skills installed (optionally bmad-qa-generate-e2e-tests).
 
 provider: claude
-model: medium
+model: sonnet  # real Claude alias; tier names (small/medium/large) require configured presets
 
 # Isolation: this workflow ALWAYS runs in the live checkout (no Archon worktree).
 # BMAD gitignores `_bmad/` (its config + the scripts the skills execute), `.claude/`
@@ -50,15 +50,23 @@ nodes:
         exit 1
       fi
 
-      # output_folder from config (BMAD convention defaults to _bmad-output)
-      OUTPUT_FOLDER="$(grep -E '^[[:space:]]*output_folder:' "$CONFIG" | head -1 | sed -E 's/^[[:space:]]*output_folder:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]*$//')"
-      [ -z "$OUTPUT_FOLDER" ] && OUTPUT_FOLDER="_bmad-output"
-      case "$OUTPUT_FOLDER" in
-        /*) : ;;
-        *) OUTPUT_FOLDER="$ROOT/$OUTPUT_FOLDER" ;;
-      esac
+      # Read paths from config. BMAD writes these with a literal {project-root}
+      # placeholder (e.g. output_folder: "{project-root}/_bmad-output"), so they must
+      # be expanded — not used verbatim. Prefer the explicit implementation_artifacts
+      # key; fall back to output_folder + /implementation-artifacts; then the default.
+      OUTPUT_RAW="$(grep -E '^[[:space:]]*output_folder:' "$CONFIG" | head -1 | sed -E 's/^[[:space:]]*output_folder:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]*$//')"
+      IMPL_RAW="$(grep -E '^[[:space:]]*implementation_artifacts:' "$CONFIG" | head -1 | sed -E 's/^[[:space:]]*implementation_artifacts:[[:space:]]*//; s/["'"'"']//g; s/[[:space:]]*$//')"
+      [ -z "$OUTPUT_RAW" ] && OUTPUT_RAW="_bmad-output"
+      [ -z "$IMPL_RAW" ] && IMPL_RAW="$OUTPUT_RAW/implementation-artifacts"
 
-      IMPL="$OUTPUT_FOLDER/implementation-artifacts"
+      # Expand BMAD's {project-root} placeholder to the real repo root.
+      OUTPUT_FOLDER="${OUTPUT_RAW//\{project-root\}/$ROOT}"
+      IMPL="${IMPL_RAW//\{project-root\}/$ROOT}"
+
+      # Make any still-relative paths absolute against ROOT.
+      case "$OUTPUT_FOLDER" in /*) : ;; *) OUTPUT_FOLDER="$ROOT/$OUTPUT_FOLDER" ;; esac
+      case "$IMPL" in /*) : ;; *) IMPL="$ROOT/$IMPL" ;; esac
+
       SPRINT="$IMPL/sprint-status.yaml"
       if [ ! -f "$SPRINT" ]; then
         echo "ERROR: sprint-status.yaml not found at $SPRINT." >&2
@@ -116,7 +124,7 @@ nodes:
   #
   - id: build-loop
     depends_on: [init]
-    model: large
+    model: opus  # heaviest node: dev + adversarial review. Lower to sonnet to trade quality for cost.
     idle_timeout: 1800000
     loop:
       until: BMAD_RUN_COMPLETE
@@ -260,7 +268,7 @@ nodes:
     depends_on: [build-loop]
     trigger_rule: all_done
     context: fresh
-    model: small
+    model: haiku  # cheap final summary
     prompt: |
       Generate a concise run report for this BMAD implementation run.
 
