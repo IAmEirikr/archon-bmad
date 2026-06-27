@@ -128,7 +128,8 @@ the other knobs) under [Configuration knobs](#configuration-knobs).
 
 - **Archon** installed (`archon` CLI or the web UI). See https://archon.diy.
 - A **BMAD-METHOD project** with planning complete — i.e. `_bmad/bmm/config.yaml` and
-  `<output_folder>/implementation-artifacts/sprint-status.yaml` both exist.
+  `<output_folder>/implementation-artifacts/sprint-status.yaml` both exist. For the default worktree
+  isolation, **track (commit) your `_bmad-output/`** so the worktree checks it out — see [Isolation](#isolation).
 - The BMAD implementation skills installed in the project under one of `.claude/skills`,
   `.agents/skills`, or `.codex/skills`:
   - `bmad-create-story` *(required)*
@@ -141,9 +142,9 @@ any project BMAD targets (the workflow itself is project-agnostic).
 
 #### Usage
 
-Run from the **root of your BMAD project** — it works directly in your live checkout. By default the
-per-story commits land on your current branch; add `--isolate` to land them on a fresh branch instead
-(see [Isolation](#isolation)):
+Run from the **root of your BMAD project**. By default Archon runs it in an isolated git worktree and
+the per-story commits land on that worktree's branch (see [Isolation](#isolation)); pass `--no-worktree`
+to run directly in your live checkout instead:
 
 ```bash
 # Implement a whole epic
@@ -166,37 +167,53 @@ natural phrasing ("epic 2", "the auth stories", "everything left") works.
 
 #### Isolation
 
-By default, Archon runs each workflow in an isolated git worktree — a fresh checkout of the repo's
-*tracked* files. For BMAD that isolation is exactly wrong: BMAD gitignores everything this workflow
-depends on — `_bmad/` (its config and the scripts the skills execute), `.claude/` (the BMAD skills
-themselves), and usually the output folder holding `sprint-status.yaml` and the story files. In a
-worktree none of that is present, so both the `init` guard and the BMAD skills fail. The live
-checkout is the only place they all exist together.
+By default, Archon runs each workflow in an isolated git **worktree** — a separate checkout under
+`~/.archon/workspaces/<group>/<repo>/worktrees/archon/`, on a branch Archon names automatically
+(`archon/task-archon-bmad-story-automator-<timestamp>`). Your live checkout is never touched, and
+multiple runs can proceed in parallel. The worktree **persists after the run** — Archon does *not*
+auto-merge or auto-delete it; you integrate and tear it down explicitly (see below).
 
-That's why the workflow declares `worktree.enabled: false` in its YAML — it pins every run to your
-live checkout. There's no flag to pass and nothing to remember; it's baked into the workflow.
+**Hydrating BMAD's gitignored inputs.** A worktree contains only *tracked* files, and BMAD gitignores
+everything the skills need to run: `_bmad/` (config and the scripts the skills execute) and the skill
+roots `.claude/`/`.agents/`/`.codex/` (the BMAD skills themselves). So the workflow's `init` node
+**copies those into the worktree** from your live checkout before anything else runs (`cp -Rn`, so it
+never overwrites a tracked file, and they stay gitignored so nothing of BMAD's tooling leaks into a
+commit). The BMAD **output** folder (`_bmad-output/` with `sprint-status.yaml` and the story files) is
+*not* copied — the workflow assumes you **track it in git** (so it's shared across people and personas),
+so the worktree checks it out natively. Commit your planning output before running.
 
-Isolation is still available, just at the **branch** level instead of the worktree level. By default
-the per-story commits land on **your current branch**. Add **`--isolate`** to the run argument and
-the workflow creates a fresh branch `bmad/<slug-of-your-selection>` up front,
-lands every commit there, and leaves it for you to review (it never auto-merges or deletes):
+**Two requirements for worktree mode:**
+
+- **A discoverable default branch.** Archon bases the worktree on `origin/HEAD`, falling back to
+  `origin/main`. If your repo has neither (a local-only repo, or a `master` default with no remote),
+  worktree creation fails — set `worktree.baseBranch` in `.archon/config.yaml`, or pass `--from <ref>`
+  per run.
+- **Build dependencies.** A fresh worktree has no gitignored deps (`node_modules/`, virtualenvs, etc.),
+  which the workflow installs for you — mirroring how Archon's own bundled dev-loop workflows handle it.
+  In two layers: `init` does a fast best-effort frozen install for the common JS case (`bun`/`npm ci`/
+  `yarn`/`pnpm`), and the `dev` phase then discovers and installs across every ecosystem (JS, plus
+  `pip`/`poetry`, `cargo`, `go mod`) before running tests. You normally don't need to do anything. The
+  exceptions are environments the auto-detect can't satisfy unattended — a **private registry needing
+  auth**, or a **missing language toolchain**; for those, provision them once (e.g. via `archon continue
+  <branch> "install deps"`) or run `--no-worktree`.
+
+**Integrating a run.** Per-story commits land on the worktree's branch; the final report prints the exact
+commands. In short — review, integrate, then tear down:
 
 ```bash
-archon workflow run archon-bmad-story-automator "epic 2 --isolate"
-# → creates & switches to branch `bmad/epic-2`, commits the run there
+git -C <live-checkout> log --oneline <base>..<worktree-branch>   # review what landed
+git -C <live-checkout> merge --no-ff <worktree-branch>           # merge locally (refs are shared), or:
+git -C <worktree> push -u origin <worktree-branch>               # push & open a PR instead
+archon complete <worktree-branch>     # remove worktree + delete branch (refuses unless merged/pushed; --force to override)
 ```
 
-Because a branch (unlike a worktree) shares the same working directory, the gitignored BMAD inputs
-are all still present — which is why this works where Archon's `--branch` worktree can't. The final
-report prints the exact commands to review and merge or discard. To integrate when you're happy:
+Re-enter the **same** worktree (inputs already hydrated) to do more:
+`archon continue <worktree-branch> --workflow archon-bmad-story-automator "<more stories>"`.
+`archon isolation list` shows active worktrees; `archon isolation cleanup --merged` bulk-removes merged ones.
 
-```bash
-git log --oneline <base>..bmad/epic-2          # see what landed
-git checkout <base> && git merge --no-ff bmad/epic-2   # merge, or:
-git branch -D bmad/epic-2                       # discard everything
-```
-
-(You can still manage branches manually instead — just omit `--isolate` and `git checkout -b` yourself.)
+**Running in the live checkout instead.** Pass `--no-worktree` to skip worktrees and run directly in your
+live checkout (the copy step then no-ops — the gitignored inputs are already there). `--branch <name>` /
+`--from <ref>` control the worktree's branch and base point.
 
 #### Configuration knobs
 

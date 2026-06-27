@@ -19,22 +19,25 @@ description: |
 provider: claude
 model: sonnet  # real Claude alias; tier names (small/medium/large) require configured presets
 
-# Isolation: this workflow ALWAYS runs in the live checkout (no Archon worktree).
-# BMAD gitignores `_bmad/` (its config + the scripts the skills execute), `.claude/`
-# (the BMAD skills themselves), and usually the output folder with sprint-status.yaml and
-# story files. An Archon worktree is a fresh checkout of TRACKED files only, so all of that
-# is absent there and both the `init` guard and the BMAD skills fail. Declaring
-# worktree.enabled:false pins the run to the live checkout, so no --no-worktree flag is
-# needed (and --branch/--from are rejected with a clear error).
+# Isolation: this workflow runs in an Archon git WORKTREE (the engine default).
+# A worktree is a fresh checkout of TRACKED files only, so BMAD's gitignored inputs are
+# absent there: `_bmad/` (its config + the scripts the skills execute) and the skill roots
+# `.claude/`/`.agents/`/`.codex/` (the BMAD skills themselves). The `init` node below copies
+# those in from your live checkout (the main worktree) before anything else runs, so the
+# `init` guard and the BMAD skills all resolve inside the worktree.
 #
-# For isolation, pass `--isolate` in the run argument; the `init` node below creates a fresh
-# `bmad/<slug>` branch up front so every per-story commit lands there:
-#   archon workflow run archon-bmad-story-automator "epic 2 --isolate"
-# Review the per-story commits on that branch, then merge or `git branch -D` to discard. (You can
-# still branch manually instead — omit `--isolate` and `git checkout -b` yourself.)
+# The BMAD OUTPUT folder (`_bmad-output/` with sprint-status.yaml and the story files) is NOT
+# copied — this workflow assumes you TRACK it in git (so it can be shared across people and
+# personas), which means the worktree checks it out natively. Commit your planning output
+# before running. (If you instead gitignore it, run with `--no-worktree` so the live checkout
+# is used — the copy step then no-ops and everything works as before.)
+#
+# Per-story commits land on the worktree's branch; the final report prints how to merge or
+# discard it. Use Archon's native flags to control the worktree: `--no-worktree` (run in the
+# live checkout), `--branch <name>` / `--from <ref>` (name/base the worktree branch).
 worktree:
-  enabled: false       # always run in the live checkout; BMAD's inputs are gitignored
-mutates_checkout: true # writes story files, sprint-status, and commits into the checkout
+  enabled: true        # run in an isolated worktree; init copies gitignored BMAD inputs in
+mutates_checkout: true # writes story files, sprint-status, and commits into the worktree
 
 nodes:
   # ─── Phase 0: Resolve the BMAD project + initialize run state ─────────
@@ -43,6 +46,47 @@ nodes:
       set -euo pipefail
       ART="$ARTIFACTS_DIR"
       ROOT="$(pwd)"
+
+      # ─── Hydrate gitignored BMAD inputs into the worktree ────────────────
+      # Archon runs this workflow in a git worktree (a fresh checkout of TRACKED files).
+      # BMAD's inputs are gitignored, so they're absent here: `_bmad/` (config + the scripts
+      # the skills execute) and the skill roots `.claude/`/`.agents/`/`.codex/` (the skills
+      # themselves). Copy them in from the main checkout so everything resolves. The main
+      # checkout is always the FIRST entry of `git worktree list`. A linked worktree has a
+      # `.git` FILE (a gitdir pointer); the live checkout has a `.git` DIRECTORY — that's how
+      # we tell them apart (symlink-proof, unlike comparing path strings). When not in a
+      # worktree (`--no-worktree`), the copy is skipped entirely. `cp -Rn` never overwrites a
+      # file already in the worktree, so tracked files (e.g. a tracked `_bmad-output/`) are
+      # left untouched.
+      MAIN_ROOT="$(git -C "$ROOT" worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p')"
+      [ -z "$MAIN_ROOT" ] && MAIN_ROOT="$ROOT"
+      IN_WORKTREE=false
+      if [ -f "$ROOT/.git" ]; then
+        IN_WORKTREE=true
+        echo "Worktree run: hydrating gitignored BMAD inputs from $MAIN_ROOT"
+        for rel in _bmad .claude .agents .codex; do
+          if [ -e "$MAIN_ROOT/$rel" ]; then
+            mkdir -p "$ROOT/$rel"
+            cp -Rn "$MAIN_ROOT/$rel/." "$ROOT/$rel/" 2>/dev/null || true
+          fi
+        done
+
+        # ─── Best-effort JS dependency install (worktrees lack gitignored node_modules) ───
+        # Mirrors Archon's bundled ralph workflow: a fast, frozen (lockfile-exact) install for the
+        # common JS case so the dev phase's tests can run. `|| true` keeps it best-effort despite
+        # `set -euo pipefail` — a failed/again-needed install never aborts init; the dev phase
+        # re-checks deps across ALL ecosystems (JS/Python/Rust/Go) and gates there. Skipped entirely
+        # in the live checkout (`--no-worktree`), where deps already exist.
+        if   [ -f "$ROOT/bun.lock" ] || [ -f "$ROOT/bun.lockb" ]; then
+          echo "Installing JS deps (bun)...";  ( cd "$ROOT" && bun install --frozen-lockfile ) 2>&1 | tail -3 || true
+        elif [ -f "$ROOT/package-lock.json" ]; then
+          echo "Installing JS deps (npm)...";  ( cd "$ROOT" && npm ci ) 2>&1 | tail -3 || true
+        elif [ -f "$ROOT/yarn.lock" ]; then
+          echo "Installing JS deps (yarn)..."; ( cd "$ROOT" && yarn install --frozen-lockfile ) 2>&1 | tail -3 || true
+        elif [ -f "$ROOT/pnpm-lock.yaml" ]; then
+          echo "Installing JS deps (pnpm)..."; ( cd "$ROOT" && pnpm install --frozen-lockfile ) 2>&1 | tail -3 || true
+        fi
+      fi
 
       CONFIG="$ROOT/_bmad/bmm/config.yaml"
       if [ ! -f "$CONFIG" ]; then
@@ -83,20 +127,17 @@ nodes:
         fi
       done
 
-      # ─── Optional branch isolation (opt-in: include `--isolate` in the run argument) ───
-      # A branch — unlike an Archon worktree — keeps the SAME working directory, so the gitignored
-      # BMAD inputs (_bmad/, .claude/, _bmad-output/) are all still present. We create it here, before
-      # the loop, so every per-story commit lands on it. At the end you review and merge (or discard)
-      # the branch yourself; the workflow never auto-merges or deletes it.
-      ISOLATE=false
-      WORK_BRANCH=""
-      BASE_BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
-      case "$ARGUMENTS" in
-        *--isolate*) ISOLATE=true ;;
-      esac
-      if [ "$ISOLATE" = true ]; then
-        # Branch name = bmad/<slug-of-selection> (the --isolate token stripped out).
-        SLUG="$(printf '%s' "$ARGUMENTS" | sed -E 's/--isolate//g' | tr '[:upper:]' '[:lower:]' \
+      # ─── Worktree branch (for the final report's integration instructions) ──────────
+      # Archon runs each workflow in its own worktree on a branch it names automatically
+      # (`archon/task-<workflow>-<timestamp>`), based off the repo's default branch — origin/HEAD,
+      # else origin/main, else `worktree.baseBranch` in .archon/config.yaml (or override per-run with
+      # `--branch`/`--from`). Capture that worktree branch plus the branch the live checkout is on, so
+      # the report can show how to integrate. The detached-HEAD fallback below is just insurance —
+      # Archon normally always hands us a named branch.
+      BASE_BRANCH="$(git -C "$MAIN_ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+      WORK_BRANCH="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")"
+      if [ "$IN_WORKTREE" = true ] && { [ "$WORK_BRANCH" = "HEAD" ] || [ -z "$WORK_BRANCH" ]; }; then
+        SLUG="$(printf '%s' "$ARGUMENTS" | tr '[:upper:]' '[:lower:]' \
                 | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-40 | sed -E 's/-+$//')"
         [ -z "$SLUG" ] && SLUG="stories"
         WORK_BRANCH="bmad/$SLUG"
@@ -104,13 +145,11 @@ nodes:
           WORK_BRANCH="bmad/$SLUG-$(date +%Y%m%d-%H%M%S)"   # avoid collision with an existing branch
         fi
         if git -C "$ROOT" checkout -b "$WORK_BRANCH" >/dev/null 2>&1; then
-          echo "Isolation ON: created and switched to '$WORK_BRANCH' (from '$BASE_BRANCH')."
+          echo "Worktree was detached; created branch '$WORK_BRANCH' for this run's commits."
         else
-          echo "WARNING: could not create branch '$WORK_BRANCH'; continuing on '$BASE_BRANCH'." >&2
-          ISOLATE=false; WORK_BRANCH=""
+          echo "WARNING: could not create a named branch in the worktree; commits stay on detached HEAD." >&2
+          WORK_BRANCH="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo "")"
         fi
-      else
-        echo "Isolation OFF: commits land on the current branch ('$BASE_BRANCH'). Pass --isolate to branch."
       fi
 
       cat > "$ART/bmad-env.json" <<EOF
@@ -120,7 +159,8 @@ nodes:
         "implementationArtifacts": "$IMPL",
         "sprintStatus": "$SPRINT",
         "skipAutomate": $SKIP_AUTOMATE,
-        "isolate": $ISOLATE,
+        "mainRoot": "$MAIN_ROOT",
+        "inWorktree": $IN_WORKTREE,
         "workBranch": "$WORK_BRANCH",
         "baseBranch": "$BASE_BRANCH"
       }
@@ -177,9 +217,8 @@ nodes:
         ## Stories the user asked to implement
         $ARGUMENTS
 
-        (Ignore any `--isolate` token in the selection above — it only toggles branch isolation and is
-        already handled by `init`. If nothing meaningful remains, target EVERY story in sprint-status
-        that is not yet `done`.)
+        (If nothing meaningful remains in the selection, target EVERY story in sprint-status that is
+        not yet `done`.)
 
         ## FIRST — load your state (every iteration)
         1. Read `$ARTIFACTS_DIR/bmad-env.json` → `{ root, outputFolder, implementationArtifacts, sprintStatus, skipAutomate }`.
@@ -227,7 +266,21 @@ nodes:
         Update `state.json`. End turn.
 
         ## phase = "dev"  → bmad-dev-story
-        Use the **bmad-dev-story** skill to implement story `{currentStory}`.
+        FIRST, ensure build dependencies are present. A worktree run starts WITHOUT the project's
+        gitignored deps (`node_modules/`, virtualenvs, …), so tests would fail spuriously. Inspect
+        `{root}` for lock/config files and run the matching install from `{root}` (absolute paths, do
+        NOT `cd` elsewhere for verification):
+          - `package.json` + `bun.lock`/`bun.lockb` → `bun install`; + `package-lock.json` → `npm install`;
+            + `yarn.lock` → `yarn install`; + `pnpm-lock.yaml` → `pnpm install`
+          - `requirements.txt` → `pip install -r requirements.txt`; `pyproject.toml` + `poetry.lock` → `poetry install`
+          - `Cargo.toml` → `cargo build`; `go.mod` → `go mod download`
+        (`init` already best-effort-installs the JS case, so re-running it is cheap and idempotent; on a
+        `--no-worktree` run the deps already exist and this is a no-op.) If the install genuinely fails
+        (network, private registry, missing toolchain), record it in the story's Dev Agent Record and do
+        NOT mark tasks `[x]` on the basis of tests that could not actually run — leave them for the
+        review gate to catch.
+
+        Then use the **bmad-dev-story** skill to implement story `{currentStory}`.
         Implement ALL tasks marked `[ ]`. Run the tests. Update the task checkboxes and the
         story's Dev Agent Record / File List. Let the skill update sprint-status. #YOLO — autonomous.
         Then set `phase = "auto"` if `skipAutomate` is false, otherwise `phase = "review"`.
@@ -337,9 +390,9 @@ nodes:
 
       Read:
       1. `$ARTIFACTS_DIR/state.json` — final status (`complete`/`failed`), completedStories, completedEpics, reason.
-      2. `$ARTIFACTS_DIR/bmad-env.json` — sprint-status path, and `isolate` / `workBranch` / `baseBranch`.
+      2. `$ARTIFACTS_DIR/bmad-env.json` — sprint-status path, and `mainRoot` / `inWorktree` / `workBranch` / `baseBranch`.
       3. The sprint-status file (from bmad-env.json) — final per-story status.
-      4. `git -C <root> log --oneline -30` — the commits this run produced.
+      4. `git -C <root> log --oneline -30` — the commits this run produced (root = the worktree).
 
       Report:
       ### Outcome
@@ -349,12 +402,25 @@ nodes:
       ### Epics & Retrospectives
       - Which epics completed and which had a retrospective run.
       ### Next steps
-      - If `isolate` is true: this run's commits are on branch `{workBranch}` (created from `{baseBranch}`).
-        The workflow did NOT merge or delete it. Give the exact commands to review and integrate:
-          `git -C <root> log --oneline {baseBranch}..{workBranch}`   (see what landed)
-          `git -C <root> checkout {baseBranch} && git -C <root> merge --no-ff {workBranch}`   (merge), or
-          `git -C <root> branch -D {workBranch}`   (discard everything).
-      - If `isolate` is false: commits landed on `{baseBranch}` directly — no branch step needed.
+      - If `inWorktree` is true: this run happened in an isolated Archon worktree at `{root}`, on branch
+        `{workBranch}`. Your live checkout was never touched (still on `{baseBranch}`), and Archon does
+        NOT auto-merge or auto-remove the worktree — it persists until you integrate and tear it down.
+        Give these exact commands:
+          # 1. Review what landed (branch refs are shared across worktrees):
+          `git -C {mainRoot} log --oneline {baseBranch}..{workBranch}`
+          # 2. Integrate — EITHER merge locally:
+          `git -C {mainRoot} merge --no-ff {workBranch}`
+          #    OR push the branch and open a PR:
+          `git -C {root} push -u origin {workBranch}`
+          # 3. Tear down the worktree + delete the branch once it's merged/pushed
+          #    (`archon complete` refuses on unmerged/unpushed/uncommitted work unless --force):
+          `archon complete {workBranch}`
+        To resume more stories in the SAME worktree (BMAD inputs already hydrated there):
+          `archon continue {workBranch} --workflow archon-bmad-story-automator "<more stories>"`
+        To discard the run entirely: `archon complete {workBranch} --force` (removes worktree + branch),
+        or `archon isolation cleanup --merged` to bulk-clean already-merged runs later.
+      - If `inWorktree` is false (ran with `--no-worktree`): commits landed on `{baseBranch}` in your
+        live checkout directly — no merge or cleanup step needed.
       - Any stories left `in-progress` or `failed` that need a human.
 
       Write the report to `$ARTIFACTS_DIR/report.md` AND output it directly so the user sees it.
